@@ -8,4 +8,5 @@ The analysis uses spark to interact with GHCN data stored in Hadoop Distributed 
 System.
 
 # Data Folders Sample (For Reference)
-![image](https://user-images.githubusercontent.com/68840596/120876928-dffe7c80-c607-11eb-81b6-0ac10081975d.png)
+![image](https://user-images.githubusercontent.com/68840596/120877099-c14cb580-c608-11eb-9192-2e0b61e3909f.png)
+
