@@ -1,0 +1,608 @@
+##Library Imports
+from pyspark import SparkContext
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import *
+from pyspark.sql.functions import substring
+from pyspark.sql.functions import col
+
+
+spark = SparkSession.builder.getOrCreate()
+sc = SparkContext.getOrCreate()
+
+
+##Processing
+
+## define schema for daily 
+schema_daily = StructType([
+    StructField('ID', StringType()),
+    StructField('DATE', StringType()),
+    StructField('ELEMENT', StringType()),
+    StructField('VALUE', IntegerType()),
+    StructField('MEASUREMENT FLAG', StringType()),
+    StructField('QUALITY FLAG', StringType()),
+    StructField('SOURCE FLAG', StringType()),
+    StructField('OBSERVATION TIME', StringType()),
+    ])
+
+##load 2020 data into daily
+daily = (
+    spark.read.format("com.databricks.spark.csv")
+    .option("header", "false")
+    .option("inferSchema", "false")
+    .schema(schema_daily)
+    .load("hdfs:///data/ghcnd/daily/2020.csv.gz")
+    .limit(1000)
+)
+  
+
+daily.cache()
+daily.show(10, False)
+
+# Load each of countries, inventory, states, stations (fixed width text format)
+
+countries_text_only = (
+    spark.read.format("text")
+    .load("hdfs:///data/ghcnd/countries")
+)
+countries_text_only.show(10, False)
+
+countries = countries_text_only.select(
+    F.trim(F.substring(F.col('value'), 1, 2)).alias('CODE').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 4, 47)).alias('NAME').cast(StringType())
+)
+countries.show(10, False)
+
+countries.count()
+
+
+states_text_only = (
+    spark.read.format("text")
+    .load("hdfs:///data/ghcnd/states")
+)
+states_text_only.show(10, False)
+
+states = states_text_only.select(
+    F.trim(F.substring(F.col('value'), 1, 2)).alias('CODE').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 4, 47)).alias('NAME').cast(StringType())
+)
+states.show(10, False)
+
+inventory_text_only = (
+    spark.read.format("text")
+    .load("hdfs:///data/ghcnd/inventory")
+)
+inventory_text_only.show(10, False)
+
+inventory = inventory_text_only.select(
+    F.trim(F.substring(F.col('value'), 1, 11)).alias('ID').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 13, 8)).alias('LATITUDE').cast(DoubleType()),
+    F.trim(F.substring(F.col('value'), 22, 9)).alias('LONGITUDE').cast(DoubleType()),
+    F.trim(F.substring(F.col('value'), 32, 4)).alias('ELEMENT').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 37, 4)).alias('FIRSTYEAR').cast(IntegerType()),
+    F.trim(F.substring(F.col('value'), 42, 4)).alias('LASTYEAR').cast(IntegerType())
+)
+inventory.show(10, False)
+
+
+stations_text_only = (
+    spark.read.format("text")
+    .load("hdfs:///data/ghcnd/stations"))
+
+stations = stations_text_only.select(
+    F.trim(F.substring(F.col('value'), 1, 11)).alias('ID').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 13, 8)).alias('LATITUDE').cast(DoubleType()),
+    F.trim(F.substring(F.col('value'), 22, 9)).alias('LONGITUDE').cast(DoubleType()),
+    F.trim(F.substring(F.col('value'), 32, 6)).alias('ELEVATION').cast(DoubleType()),
+    F.trim(F.substring(F.col('value'), 39, 2)).alias('STATE').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 42, 32)).alias('NAME').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 73, 3)).alias('GSN FLAG').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 77, 3)).alias('HCN/CRN FLAG').cast(StringType()),
+    F.trim(F.substring(F.col('value'), 81, 5)).alias('WMO ID').cast(StringType())
+)
+stations.show(10, False)
+
+
+
+## To find number of stations without WMO ID
+from pyspark.sql.functions import isnan, when, count, col, isnan
+stations.filter((stations["WMO ID"] == "") | stations["WMO ID"].isNull() | isnan(stations["WMO ID"])).count()
+
+
+##Extract the two character country code from each station code in stations and store the output as a new column using the withColumn command
+stations = stations.withColumn("countrycode", stations.ID.substr(1,2))
+stations.show()
+
+stations =  stations.withColumnRenamed("NAME","STATIONNAME")
+
+##Left Join stations with countries
+    stations = stations.join(countries, stations["countrycode"] == countries["code"],how='left')
+    stations.show()
+
+##remove duplicate column post join
+stations = stations.drop("code")       
+
+
+#Left Join stations with states
+
+spark.conf.set("spark.sql.crossJoin.enabled", "true")
+
+states=states.withColumnRenamed("NAME","STATE NAME")
+
+stations = stations.join(states, stations["STATE"] == states["CODE"],how='left')
+stations.filter(stations["CODE"] != "NULL").show()
+
+##groupby min and max years
+
+invyr = inventory.groupBy('ID').agg(F.min('FIRSTYEAR'),F.max('LASTYEAR'))
+
+##distinct element of each station
+
+inv = inventory.groupBy("ID").agg(F.countDistinct("element"))
+inv.show(20)
+
+##overall distinct elements collected by all stations in inventory
+inventory.select(F.countDistinct("element")).show()
+
+inventory.registerTempTable("inv")
+
+##Element type column
+
+inventorymy = inventory.withColumn('elementtype',
+    F.when((F.col("ELEMENT") == 'PRCP') , 'CORE')
+    .when((F.col("ELEMENT") == 'SNOW') , 'CORE')
+    .when((F.col("ELEMENT") == 'SNWD') , 'CORE')
+    .when((F.col("ELEMENT") == 'TMAX') , 'CORE')
+    .when((F.col("ELEMENT") == 'TMIN') , 'CORE')
+    .otherwise('other')
+)
+
+inventorymy.filter(inventorymy["elementtype"] == "CORE").count()
+inventorymy.filter(inventorymy["elementtype"] == "OTHER").count()
+
+inv1core = inventorymy.filter(inventorymy["elementtype"] == "CORE")
+inv1core =inv1core.groupBy("ID").agg(F.countDistinct("ELEMENT"))
+inv1core.show(20)
+
+inv1core.filter(inv1core["count(DISTINCT ELEMENT)" == "5").count()
+
+
+invprcp = inventorymy.filter(inventorymy["element"] == "PRCP")
+invprcp1 = inv1core.join(invprcp, inv1core["ID"] == invprcp["ID"],how='left')
+invprcp1.filter(invprcp1["count(DISTINCT ELEMENT)"]== "1").count()
+
+
+##collect set
+
+invfin = inventorymy.groupby("ID").agg(F.collect_set("Element"))
+
+##year with element
+
+invfin = invfin.join(invyr, invfin["ID"] == invyr["ID"],how='left').drop(invyr["ID"])
+
+##join count of element
+
+invfin = invfin.join(inv,invfin["ID"] == inv["ID"],how=('left')).drop(inv["ID"])
+
+##inventory with stations
+
+stations = stations.join(invfin, stations["ID"] == invfin["ID"],how='left').drop(invfin["ID"])
+
+stations=stations.withColumnRenamed("GSN FLAG","GSNFLAG")
+stations=stations.withColumnRenamed("HCN/CRN FLAG","HCN_CRN_FLAG")
+stations=stations.withColumnRenamed("WMO ID","WMOID")
+stations=stations.withColumnRenamed("STATE NAME","STATENAME")
+stations=stations.withColumnRenamed("collect_set(Element)","ELEMENT_SET")
+stations=stations.withColumnRenamed("min(FIRSTYEAR)","MINFIRSTYEAR")
+stations=stations.withColumnRenamed("max(LASTYEAR)","MAXLASTYEAR")
+stations=stations.withColumnRenamed("count(DISTINCT element)","DISTINCTELEMENT")
+
+##write to parquet
+
+stations.write.parquet("hdfs:///user/gsa59/outputA/station_meta.parquet", mode='overwrite')
+
+
+## daily with meta data
+
+daily_sub = daily.join(stations, daily["ID"] == stations["ID"],how='left').drop(stations["ID"])
+
+daily_sub.filter(daily_sub["STATIONNAME"]=="NULL").count()
+
+
+##Analysis 1a
+
+##Exploring Daily data
+
+daily1 = (
+    spark.read.format("com.databricks.spark.csv")
+    .option("header", "false")
+    .option("inferSchema", "false")
+    .schema(schema_daily)
+    .load("hdfs:///data/ghcnd/daily/2000.csv.gz")
+)
+  
+
+##read from parquet
+
+mystations= spark.read.parquet("hdfs:///user/gsa59/outputA/station_meta.parquet")
+
+mystations.count()
+
+
+daily1  = daily.join(mystations, daily["ID"] == mystations["ID"],how='left').drop(mystations["ID"])
+
+daily1.count()
+
+##table format for spark.sql
+
+mystations.registerTempTable("mystations") 
+
+
+##creation of flags temp table
+
+flags = spark.sql("""
+ select ID
+ ,case when GSNFLAG = 'GSN' then 1 else 0 end as gsnflag
+ ,case when HCN_CRN_FLAG = 'HCN' then 1 else 0 end as hcnflag
+ ,case when HCN_CRN_FLAG = 'CRN' then 1 else 0 end as  crnflag
+ from mystations
+ """)
+flags.show()
+flags.registerTempTable("flags")
+
+##query to fetch count of each flag
+spark.sql("""
+ select gsnflag, count(distinct ID) as distinctcount, count(ID) as count
+ from flags
+ group by 1
+ """).show()
+ 
+spark.sql("""
+ select hcnflag, count(distinct ID) as distinctcount, count(ID) as count
+ from flags
+ group by 1
+ """).show()
+ 
+spark.sql("""
+ select crnflag, count(distinct ID) as distinctcount, count(ID) as count
+ from flags
+ group by 1
+ """).show()
+    
+## to find stations with more than one flag
+totalflag = spark.sql("""
+ select ID, sum(gsnflag) as gsn,  sum(hcnflag) as hcn, sum(crnflag) as crn
+ from flags
+ group by 1
+ """)
+totalflag.show()
+totalflag.registerTempTable("totalflag")
+spark.sql("""
+ select ID, sum(gsn+hcn+crn) as total
+ from totalflag
+ group by 1
+ having total>1
+ """).show()
+
+##number of stations in each country
+
+      
+
+country_station_count = """
+                SELECT countrycode, Count(*)
+                FROM mystations
+                GROUP BY countrycode
+ """
+country_station_count = spark.sql(country_station_count)
+country_station_count.show()
+
+
+
+
+##adding station count to countries
+
+countries.registerTempTable('countries')     ##countries table
+country_station_count = country_station_count.withColumnRenamed("count(1)","Stationcount")
+                 
+country_station_count.registerTempTable("country_station_count") ##count table
+
+mycountries ="""
+                 SELECT countries.*, country_station_count.Stationcount
+                 FROM countries
+                 LEFT JOIN country_station_count
+                 ON countries.CODE = country_station_count.countrycode
+ """
+mycountries = spark.sql(mycountries)
+
+mycountries.show()
+
+mycountries.write.parquet("hdfs:///user/gsa59/outputA/country_updated")
+
+##number of stations in each state
+
+state_station_count = """
+                SELECT CODE, Count(*)
+                FROM mystations
+                GROUP BY CODE
+ """
+state_station_count = spark.sql(state_station_count)
+state_station_count.show()
+
+
+ 
+
+##adding station count to states
+states.registerTempTable('states') 
+state_station_count = state_station_count.withColumnRenamed("count(1)","Stationcount1")
+                 
+state_station_count.registerTempTable("state_station_count") ##count table
+
+mystates ="""
+                     SELECT states.*, state_station_count.Stationcount1
+                     FROM states
+                     LEFT JOIN state_station_count
+                     ON states.CODE = state_station_count.CODE 
+"""
+mystates = spark.sql(mystates)
+
+mystates.show()
+
+mystates.write.parquet("hdfs:///user/gsa59/outputA/states_updated")
+
+##southern hemisphere stations
+
+
+
+southernhemi = """
+           SELECT Count(ID) AS SOUTHERN_HEMI
+           FROM mystations
+           WHERE latitude < 0
+ """
+southern_stations = spark.sql(southernhemi)
+southern_stations.show()
+
+##united states territory
+
+US_territory = """
+                   SELECT NAME
+                   FROM countries
+                   WHERE NAME LIKE '%[United States]%'
+                   GROUP BY NAME
+"""
+US_territory= spark.sql(US_territory)
+US_territory.show()
+US_territory.count()
+
+scjoin=(mystations
+        .join(countries, countries.CODE==mystations.countrycode, how= 'inner')
+        .drop(mystations.countrycode)
+        .drop(mystations.NAME)
+)
+scjoin.where(scjoin.NAME.like('%[United States]%')).count()
+
+## Analysis Q2
+
+##user defined functions
+
+stations_func=(mystations
+                .withColumnRenamed('LATITUDE','S_LATITUDE')
+                .withColumnRenamed('LONGITUDE','S_LONGITUDE').withColumnRenamed('ID','STATIONID')
+                .crossJoin(mystations)
+                )
+
+#Haversine Method for distance Calculation
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from pyspark.sql import functions as F
+from pyspark.sql import DataFrameWriter as W
+from math import radians, cos, sin, asin, sqrt
+spark = (SparkSession.builder.appName("HDFS_Haversine_Fun").getOrCreate())
+
+## define udf
+def distance(latitude1,longitude1,latitude2,longitude2):
+    lat1= math.radians(latitude1)
+    lat2= math.radians(latitude2)
+    lat_dist= math.radians(latitude2 - latitude1)
+    long_dist= math.radians(longitude1 - longitude2)
+    
+    a= (math.sin(lat_dist/2)*math.sin(lat_dist/2)) + (math.cos(lat1)*math.cos(lat2)*math.sin(long_dist/2)*math.sin(long_dist/2))
+    c= 2 * math.atan2(math.sqrt(a),math.sqrt(1-a))
+    R= 6371
+    return R*c
+    
+distance_udf = F.udf(distance,FloatType())
+
+## to test cross join
+
+cross= (mystations
+         .limit(100)
+         .select("ID","LATITUDE", "LONGITUDE"))
+
+
+
+x = cross.select([F.col(CODE).alias(CODE + "X") for CODE in cross.columns])
+y = cross.select([F.col(CODE).alias(CODE + "Y") for CODE in cross.columns])
+
+cross= x.crossJoin(y)
+cross= (cross.filter(
+     cross.IDX != cross.IDY))
+cross.show()
+
+##apply udf 
+
+
+distance1 = (cross.withColumn("DISTANCE", distance_udf(
+     cross.LATITUDEX, cross.LONGITUDEX,
+     cross.LATITUDEY, cross.LONGITUDEY)
+     ))
+distance1.show()
+
+##NZ stations
+
+NZ = (mystations
+     .filter(mystations["countrycode"]=="NZ")
+     .select("ID","LATITUDE", "LONGITUDE","countrycode"))
+
+nzx = NZ.select([F.col(CODE).alias(CODE + "X") for CODE in NZ.columns])
+nzy = NZ.select([F.col(CODE).alias(CODE + "Y") for CODE in NZ.columns])
+
+NZ= nzx.crossJoin(nzy)
+NZ= (NZ.filter(
+     NZ.IDX != NZ.IDY))
+NZ.show()
+
+NZdistance = (NZ.withColumn("DISTANCE", distance_udf(
+     NZ.LATITUDEX, NZ.LONGITUDEX,
+     NZ.LATITUDEY, NZ.LONGITUDEY)
+     ))
+NZdistance.show()
+NZdistance.sort(col("DISTANCE")).show(5) ##to find stations with minimum distance
+
+NZdistance.write.parquet("hdfs:///user/gsa59/outputA/NZdistance")
+
+##Analysis Q3
+##block size for 2020 and 2010
+
+hdfs getconf -confKey "dfs.blocksize"
+hdfs fsck /data/ghcnd/daily/2020.csv.gz -blocks
+hdfs fsck /data/ghcnd/daily/2010.csv.gz -blocks
+
+##load 2020 and 2015
+daily2015 = (
+     spark.read.format("com.databricks.spark.csv")
+     .option("header", "false")
+     .option("inferSchema", "false")
+     .schema(schema_daily)
+     .load("hdfs:///data/ghcnd/daily/2015.csv.gz")
+ )
+
+daily2015.show(10, False)
+daily2015.count()
+
+daily2020 = (
+     spark.read.format("com.databricks.spark.csv")
+     .option("header", "false")
+     .option("inferSchema", "false")
+     .schema(schema_daily)
+     .load("hdfs:///data/ghcnd/daily/2020.csv.gz")
+ )
+
+daily2020.show(10, False)
+daily2020.count()
+
+##load 2015 to 2020 daily
+daily_2015_20 = (
+     spark.read.format("com.databricks.spark.csv")
+     .option("header", "false")
+     .option("inferSchema", "false")
+     .schema(schema_daily)
+     .load("hdfs:///data/ghcnd/daily/201{[5-9],20}.csv.gz") ##usingregex
+     .repartition("ID")
+)
+daily_2015_20.show(10, False)
+daily_2015_20.count()
+
+##Analysis Q4
+##All of daily
+
+daily = (
+     spark.read.format("com.databricks.spark.csv")
+     .option("header", "false")
+     .option("inferSchema", "false")
+     .schema(schema_daily)
+     .load("hdfs:///data/ghcnd/daily/*")
+ )
+daily.show(10,False)
+daily.count()
+
+daily.registerTempTable('daily')
+
+##4b 
+##Core elements
+
+dailycore = daily.filter(F.col('ELEMENT').isin(["PRCP", "SNOW" ,"SNWD", "TMAX", "TMIN"]) == True)
+
+dailycore.count()
+
+dailycore.registerTempTable('dailycore')
+
+coreobs = """
+                SELECT ELEMENT, Count(ELEMENT)
+                FROM dailycore
+                GROUP BY ELEMENT
+ """
+coreobs = spark.sql(coreobs)
+coreobs.show()
+
+##4c TMIN but not TMAX
+
+Tmin=(daily.filter(F.col("ELEMENT").isin("TMAX","TMIN")).
+                groupBy("ID","DATE").agg(F.collect_set("ELEMENT").alias("ELEMENT_SET")).
+                withColumn("TMIN",F.array_contains(F.col("ELEMENT_SET"),"TMIN")).
+                withColumn("TMAX",F.array_contains(F.col("ELEMENT_SET"),"TMAX")).groupBy("ID","DATE","TMIN","TMAX").count().filter(F.col("TMAX")==False))
+                
+Tmin.count()
+
+Tmin.select('ID').distinct().count() ##distinct station observing only TMIN.
+
+##4d TMIN and TMAX of NZ
+ 
+NZ_TMIN_TMAX= daily.join(mystations,on="ID",how="left")
+NZ_TMIN_TMAX=NZ_TMIN_TMAX.filter((F.col('ELEMENT').isin("TMAX","TMIN")) & (F.col("ID").startswith("NZ")))
+                
+                
+                
+NZ_TMIN_TMAX=NZ_TMIN_TMAX.withColumn("TOTALYEARS",F.col("MaxLastYear")-F.col("MinFirstYear")+1)
+NZ_TMIN_TMAX=NZ_TMIN_TMAX.drop("ELEMENT_SET")
+NZ_TMIN_TMAX.count()
+NZ_TMIN_TMAX.select("TOTALYEARS").show()
+
+
+NZ_TMIN_TMAX.coalesce(1).write.csv("hdfs:///user/gsa59/outputA/NZ_TMIN_TMAX")
+ 
+##4E Average rainfall across years and countries.
+
+countries = spark.read.parquet("hdfs:///user/gsa59/outputA/country_updated") ##save to output directory
+
+countries.registerTempTable('countries')
+
+avgprcp = """
+    SELECT YEAR, COUNTRY_NAME, mean(VALUE) as AVGRAIN
+    FROM (
+        SELECT x.*, SUBSTRING(x.DATE,1,4) as YEAR, y.NAME as COUNTRY_NAME
+        FROM (SELECT * FROM daily
+              WHERE ELEMENT = 'PRCP') x  
+        LEFT JOIN countries y
+         ON SUBSTRING(x.ID,1,2) = y.CODE
+         )
+    GROUP BY 1,2
+    ORDER BY AVGRAIN Desc
+
+"""
+avgprcp = spark.sql(avgprcp)
+avgprcp.show()
+
+avgprcp.coalesce(1).write.csv("hdfs:///user/gsa59/outputA/PRCP")
+
+
+##challenge
+##explore Q FLAG
+
+daily.groupBy(F.col("QUALITY FLAG")).count().show()
+
+
+##copy to local
+hdfs dfs -copyToLocal hdfs:///user/gsa59/outputA/NZ_TMIN_TMAX/part-00000-ca2ec652-a59f-41a1-8683-79fca1df0826-c000.csv ~/part-00000-ca2ec652-a59f-41a1-8683-79fca1df0826-c000.csv
+
+##linecount 
+wc ~/part-00000-ca2ec652-a59f-41a1-8683-79fca1df0826-c000.csv
+
+##copy to local
+hdfs dfs -copyToLocal hdfs:///user/gsa59/outputA/PRCP/part-00000-4714bb7e-2336-43b6-828f-17ebffb1e0f0-c000.csv ~part-00000-4714bb7e-2336-43b6-828f-17ebffb1e0f0-c000.csv
+
+
+
+
+
+
+
